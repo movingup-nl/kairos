@@ -5,14 +5,33 @@ nav_order: 1
 
 # Getting started
 
-> ⚠️ Kairos is pre-alpha. Runtime implementations are stubs. This guide shows the intended shape of a Kairos application; the code will not yet execute.
+> ⚠️ Kairos is pre-alpha. The in-memory adapter and test harness work today; the Drizzle/Postgres adapter is the next implementation step. The code in this guide shows the intended shape of a Kairos app — you can run the in-memory pieces now and the Postgres pieces soon.
 
-This guide walks through the canonical Kairos example: a course-subscription feature with two invariants that span what would classically be two aggregates.
+Let's build the canonical Kairos feature: subscribing a student to a course, enforcing two rules that span what would classically be two aggregates.
 
-**Invariants:**
+**The rules:**
 
 - A course has a fixed capacity. It can't be exceeded.
-- A student can be subscribed to at most 5 courses.
+- A student can be in at most 5 courses.
+
+If you haven't read [Concepts](concepts.html) yet, do that first — it explains why this framework works the way it does.
+
+---
+
+## What you're building
+
+```mermaid
+flowchart LR
+    User([User]) -- form submit --> RSC[Server action]
+    RSC -- execute --> Cmd[subscribeStudent command]
+    Cmd -- read --> Log[(Event log)]
+    Cmd -- append --> Log
+    Log --> Runner[Projection runner]
+    Runner --> Table[(enrollments table)]
+    Page[RSC page] -- Drizzle query --> Table
+```
+
+The form triggers a server action. The action runs the command. The command reads and appends events under DCB. The projection runner feeds new events into a plain Drizzle table. Your page queries that table directly.
 
 ---
 
@@ -20,15 +39,15 @@ This guide walks through the canonical Kairos example: a course-subscription fea
 
 ```bash
 npm install kairos drizzle-orm zod
-# peer deps (if using the Next.js wrappers)
+# peer deps if you use the Next.js wrappers
 npm install next react
 ```
 
 ---
 
-## 2. Define events
+## 2. Define the events
 
-Events are the vocabulary of your domain. They should read like past-tense sentences.
+Events are the nouns of your domain. Past-tense, immutable, tagged.
 
 ```ts
 // src/domain/course/events.ts
@@ -48,15 +67,13 @@ export const CourseCapacityChanged = defineEvent(
 export const StudentSubscribed = defineEvent('StudentSubscribed', z.object({}))
 ```
 
-Choose tag keys now, even though they're not in the event definition — they're the foreign keys of your domain.
-
-- `CourseCreated` → tagged `{ courseId }`
-- `CourseCapacityChanged` → tagged `{ courseId }`
-- `StudentSubscribed` → tagged `{ courseId, studentId }`
+You'll tag them with `{ courseId }` and (where relevant) `{ studentId }`. Tags are domain vocabulary — the foreign keys of your event log.
 
 ---
 
 ## 3. Define the command
+
+The handler reads, decides, appends.
 
 ```ts
 // src/domain/course/subscribe-student.ts
@@ -73,20 +90,20 @@ export const subscribeStudent = defineCommand({
     })
 
     let capacity = 0
-    let enrolledInCourse = 0
-    let studentCourseCount = 0
+    let enrolled = 0
+    let studentCourses = 0
 
     for (const e of events) {
       if (e.type === 'CourseCreated')         capacity = (e.data as { capacity: number }).capacity
       if (e.type === 'CourseCapacityChanged') capacity = (e.data as { capacity: number }).capacity
       if (e.type === 'StudentSubscribed') {
-        if (e.tags.courseId  === courseId)  enrolledInCourse++
-        if (e.tags.studentId === studentId) studentCourseCount++
+        if (e.tags.courseId  === courseId)  enrolled++
+        if (e.tags.studentId === studentId) studentCourses++
       }
     }
 
-    if (enrolledInCourse   >= capacity) throw new BusinessRuleError('Course is full')
-    if (studentCourseCount >= 5)        throw new BusinessRuleError('Student is at course limit')
+    if (enrolled       >= capacity) throw new BusinessRuleError('Course is full')
+    if (studentCourses >= 5)        throw new BusinessRuleError('Student at course limit')
 
     await ctx.append(
       [{ type: 'StudentSubscribed', tags: { courseId, studentId }, data: {} }],
@@ -96,35 +113,28 @@ export const subscribeStudent = defineCommand({
 })
 ```
 
-**What's happening:**
-
-- The `read` query scopes to events tagged with *either* this course or this student.
-- The fold computes the three numbers we need.
-- The invariants are enforced with `BusinessRuleError`.
-- The append is guarded by `appendCondition`. If another request subscribed the same student or filled the course between our read and append, the append fails with `DCBConflictError`.
+The `appendCondition` is the DCB guard — if another request appended a matching event between our read and our append, `ctx.append` throws `DCBConflictError` and the caller retries.
 
 ---
 
 ## 4. Define a projection
-
-Projections turn events into read models your UI can query.
 
 ```ts
 // src/domain/course/projections.ts
 import { defineProjection } from 'kairos'
 import { pgTable, text, timestamp } from 'drizzle-orm/pg-core'
 
-export const enrollments = pgTable('enrollments', {
+export const enrollmentsTable = pgTable('enrollments', {
   courseId:  text('course_id').notNull(),
   studentId: text('student_id').notNull(),
   at:        timestamp('at', { withTimezone: true }).notNull(),
 })
 
-export const enrollmentsProjection = defineProjection({
+export const enrollments = defineProjection({
   name: 'enrollments',
   on: {
     StudentSubscribed: async (event, tx: any) => {
-      await tx.insert(enrollments).values({
+      await tx.insert(enrollmentsTable).values({
         courseId:  event.tags.courseId,
         studentId: event.tags.studentId,
         at:        event.recordedAt,
@@ -134,9 +144,11 @@ export const enrollmentsProjection = defineProjection({
 })
 ```
 
+This projection reacts to `StudentSubscribed` events only. It writes a row into `enrollments` — the read model your pages will query.
+
 ---
 
-## 5. Wire up Kairos
+## 5. Wire it up
 
 ```ts
 // src/kairos.ts
@@ -146,7 +158,7 @@ import { drizzle } from 'drizzle-orm/node-postgres'
 import { Pool } from 'pg'
 
 import { CourseCreated, CourseCapacityChanged, StudentSubscribed } from './domain/course/events.js'
-import { enrollmentsProjection } from './domain/course/projections.js'
+import { enrollments } from './domain/course/projections.js'
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL })
 export const db = drizzle(pool)
@@ -154,11 +166,11 @@ export const db = drizzle(pool)
 export const kairos = createKairos({
   store: createDrizzleEventStore({ db }),
   events: [CourseCreated, CourseCapacityChanged, StudentSubscribed],
-  projections: [enrollmentsProjection],
+  projections: [enrollments],
 })
 ```
 
-Start the projection runner when the Next.js server boots:
+Start the projection runner when Next.js boots:
 
 ```ts
 // instrumentation.ts
@@ -172,38 +184,37 @@ export async function register() {
 
 ---
 
-## 6. Invoke from Next.js
-
-### As a server action
-
-```ts
-// app/courses/[id]/actions.ts
-'use server'
-import { toServerAction } from 'kairos/next'
-import { subscribeStudent } from '@/src/domain/course/subscribe-student'
-import { kairos } from '@/src/kairos'
-
-export const subscribe = toServerAction(subscribeStudent, {
-  kairos,
-  waitFor: 'enrollments', // block until the enrollments projection catches up
-})
-```
+## 6. Use it from a page
 
 ```tsx
 // app/courses/[id]/page.tsx
 import { db } from '@/src/kairos'
-import { enrollments } from '@/src/domain/course/projections'
+import { enrollmentsTable } from '@/src/domain/course/projections'
+import { subscribeStudent } from '@/src/domain/course/subscribe-student'
+import { toServerAction } from 'kairos/next'
+import { kairos } from '@/src/kairos'
 import { eq } from 'drizzle-orm'
-import { subscribe } from './actions'
+
+const subscribe = toServerAction(subscribeStudent, {
+  kairos,
+  waitFor: 'enrollments', // projection must catch up before the action returns
+})
 
 export default async function CoursePage({ params }: { params: { id: string } }) {
-  const rows = await db.select().from(enrollments).where(eq(enrollments.courseId, params.id))
+  const rows = await db
+    .select()
+    .from(enrollmentsTable)
+    .where(eq(enrollmentsTable.courseId, params.id))
+
   return (
     <>
       <ul>{rows.map(r => <li key={r.studentId}>{r.studentId}</li>)}</ul>
       <form action={async (fd) => {
         'use server'
-        await subscribe({ courseId: params.id, studentId: String(fd.get('studentId')) })
+        await subscribe({
+          courseId:  params.id,
+          studentId: String(fd.get('studentId')),
+        })
       }}>
         <input name="studentId" />
         <button>Subscribe</button>
@@ -213,22 +224,15 @@ export default async function CoursePage({ params }: { params: { id: string } })
 }
 ```
 
-Notice the RSC query is plain Drizzle — Kairos doesn't sit between your pages and your read model.
+That's the full feature. Notice the RSC query is plain Drizzle — Kairos does not stand between your page and your read model.
 
-### As a route handler
-
-```ts
-// app/api/subscribe/route.ts
-import { toRouteHandler } from 'kairos/next'
-import { subscribeStudent } from '@/src/domain/course/subscribe-student'
-import { kairos } from '@/src/kairos'
-
-export const POST = toRouteHandler(subscribeStudent, { kairos })
-```
+Prefer a REST endpoint? `toRouteHandler` is the equivalent wrapper for `app/api/*/route.ts`.
 
 ---
 
 ## 7. Test it
+
+Tests run against the in-memory adapter. No Postgres, no Docker, millisecond execution.
 
 ```ts
 // src/domain/course/subscribe-student.test.ts
@@ -237,13 +241,13 @@ import { BusinessRuleError } from 'kairos'
 import { describe, it, expect } from 'vitest'
 import { subscribeStudent } from './subscribe-student.js'
 import { CourseCreated, StudentSubscribed } from './events.js'
-import { enrollmentsProjection } from './projections.js'
+import { enrollments } from './projections.js'
 
 describe('SubscribeStudent', () => {
-  it('rejects when course is full', async () => {
+  it('rejects when the course is full', async () => {
     const k = createTestKairos({
       events: [CourseCreated, StudentSubscribed],
-      projections: [enrollmentsProjection],
+      projections: [enrollments],
     })
 
     await k.given([
@@ -258,12 +262,12 @@ describe('SubscribeStudent', () => {
 })
 ```
 
-Tests run against the in-memory adapter. Projections run synchronously. No Postgres required.
+`k.given` seeds events directly (skipping command handlers). `k.execute` runs a command. Projections run synchronously in the test harness, so after `execute` returns, your read model is already up to date.
 
 ---
 
-## Next steps
+## Where to next
 
-- Read [concepts.md](concepts.md) if you haven't yet — DCB in particular repays understanding.
-- Read the [design doc](plans/2026-04-15-kairos-design.md) for what's in v0.1 and what's deferred.
-- Browse the [API reference](api.md).
+- [Concepts](concepts.html) — the mental model behind the API.
+- [API reference](api.html) — everything you can import.
+- [Design doc](plans/2026-04-15-kairos-design.html) — what's in v0.1, what's deferred, and why.

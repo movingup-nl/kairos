@@ -17,3 +17,6 @@ footer_content: >-
 
 plugins:
   - jekyll-remote-theme
+
+mermaid:
+  version: "10.9.0"

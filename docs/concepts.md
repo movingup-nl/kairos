@@ -5,161 +5,289 @@ nav_order: 2
 
 # Concepts
 
-Kairos is built on four ideas. You can use the framework knowing only the first two, but understanding all four tells you *why* the API looks the way it does.
+This page walks through the ideas Kairos is built on by solving one concrete problem. By the end you'll understand events, commands, projections, and — the thing the framework is named after — Dynamic Consistency Boundaries.
 
-1. **Events as the source of truth**
-2. **Commands as intent**
-3. **Projections as derived state**
-4. **Dynamic Consistency Boundaries (DCB) as the atomicity model**
+If you're brand new to event sourcing and CQRS, you'll pick up the essentials here. If you want a deeper dive later, Martin Fowler's [Event Sourcing](https://martinfowler.com/eaaDev/EventSourcing.html) and [CQRS](https://martinfowler.com/bliki/CQRS.html) posts are the classics.
 
 ---
 
-## 1. Events as the source of truth
+## The problem
 
-An **event** is a fact about something that happened, recorded past-tense: `CourseCreated`, `StudentSubscribed`, `CourseCapacityChanged`. Once written, events are immutable.
+You're building a course-registration feature. A student clicks Subscribe. Two rules must hold:
 
-Your application's authoritative state is the **ordered sequence of events**, not the contents of any table. All other state — SQL rows, caches, search indexes — is derived.
+1. A course has a fixed capacity. The last seat can be taken only once.
+2. A student can be in at most five courses.
 
-This has two consequences that shape everything else:
+In a CRUD app this feels deceptively simple — an `INSERT` into `enrollments` with a few checks. But now imagine two students click Subscribe at the exact same moment for the last remaining seat. Who wins?
 
-- **History is free.** You never "lose" information to an `UPDATE`. Why the state is what it is, is always answerable.
-- **Read models are evolutionary.** Add a new way to read the data without touching writes. Rebuild from scratch when you change your mind.
+If you've shipped this kind of feature before, you know what comes next: row locks, `SELECT FOR UPDATE`, careful transaction isolation, subtle bugs. Maybe you split the rules across two services and chase phantom overbookings in production.
 
-Every event in Kairos has four parts:
-
-| Part        | Example                                         | Purpose                                    |
-| ----------- | ----------------------------------------------- | ------------------------------------------ |
-| `type`      | `"StudentSubscribed"`                           | What kind of fact this is                  |
-| `data`      | `{ seatNumber: 12 }`                            | Payload specific to this event type        |
-| `tags`      | `{ courseId: "c1", studentId: "s1" }`           | The *boundaries* this event belongs to (DCB) |
-| `position`  | `4217` (assigned by store)                      | Global monotonic order                     |
+Kairos is built around a different answer. Let's build it up one idea at a time.
 
 ---
 
-## 2. Commands as intent
+## Idea 1: facts instead of rows
 
-A **command** is a request to change state: `SubscribeStudent`, `ChangeCourseCapacity`. Commands are imperative, present-tense, and *may fail* — they're attempts, not facts.
+Instead of storing the *current state* in a table you mutate, you store the *stream of things that happened* and never mutate anything.
 
-In Kairos a command is a function:
+When a course is created, you write:
 
 ```ts
-defineCommand({
+{ type: 'CourseCreated', tags: { courseId: 'c1' }, data: { title: 'DDD 101', capacity: 2 } }
+```
+
+When a student subscribes, you write:
+
+```ts
+{ type: 'StudentSubscribed', tags: { courseId: 'c1', studentId: 's1' }, data: {} }
+```
+
+That's it. An **event** is a past-tense fact: its type, the data specific to that fact, and a set of **tags** — small key/value labels that say "this fact belongs to this course" or "to this student." Once written, events never change. You always append, never update.
+
+Two consequences matter:
+
+- **History is free.** You never lose information to an `UPDATE`. "Why is the state like this?" is always answerable by reading the events.
+- **State is derived, not stored.** Whether a course is full, how many courses a student is in, what a classroom looks like — all computed by replaying the relevant events.
+
+In Kairos, you declare events with Zod schemas:
+
+```ts
+import { defineEvent } from 'kairos'
+import { z } from 'zod'
+
+export const CourseCreated     = defineEvent('CourseCreated', z.object({ title: z.string(), capacity: z.number().int().positive() }))
+export const StudentSubscribed = defineEvent('StudentSubscribed', z.object({}))
+```
+
+---
+
+## Idea 2: commands as intent
+
+If events are past-tense facts, what's the present-tense request to make one happen? A **command**. `SubscribeStudent` is a command. It *may fail* — the course might be full — so it's an attempt, not a fact.
+
+A command handler does three things in order: read the events it needs, decide, and append new events.
+
+```ts
+import { defineCommand, BusinessRuleError } from 'kairos'
+
+export const subscribeStudent = defineCommand({
   name: 'SubscribeStudent',
   input: z.object({ courseId: z.string(), studentId: z.string() }),
-  handler: async (input, ctx) => { /* read → decide → append */ },
+  handler: async ({ courseId, studentId }, ctx) => {
+    // 1. read relevant events
+    const { events, appendCondition } = await ctx.read({
+      tags: [{ courseId }, { studentId }],
+      eventTypes: ['CourseCreated', 'StudentSubscribed'],
+    })
+
+    // 2. decide
+    let capacity = 0, enrolled = 0, studentCourses = 0
+    for (const e of events) {
+      if (e.type === 'CourseCreated')     capacity = (e.data as { capacity: number }).capacity
+      if (e.type === 'StudentSubscribed') {
+        if (e.tags.courseId  === courseId)  enrolled++
+        if (e.tags.studentId === studentId) studentCourses++
+      }
+    }
+    if (enrolled       >= capacity) throw new BusinessRuleError('Course is full')
+    if (studentCourses >= 5)        throw new BusinessRuleError('Student is at limit')
+
+    // 3. append
+    await ctx.append(
+      [{ type: 'StudentSubscribed', tags: { courseId, studentId }, data: {} }],
+      appendCondition,
+    )
+  },
 })
 ```
 
-The handler does three things, in order:
+A few things to notice:
 
-1. **Read** the events relevant to this decision via `ctx.read({ tags, eventTypes })`.
-2. **Decide** — fold the events into whatever state you need, enforce invariants, produce new events.
-3. **Append** those new events via `ctx.append(events, appendCondition)`.
+- **There's no class.** No `Student` aggregate, no `Course` aggregate, no repository. The handler *is* the decider. We'll come back to why.
+- **The fold is explicit.** The handler walks over the events it read and builds exactly the state it needs — no more, no less.
+- **The append carries an `appendCondition`.** That's the thing in the next section. Keep reading.
 
-If the invariants are violated, throw `BusinessRuleError`. If another command appended conflicting events between your read and append, `ctx.append` throws `DCBConflictError` — more on that below.
+The full lifecycle of a command:
 
-**There is no aggregate class.** The command handler is the decider. What used to live on an aggregate lives in the handler, scoped to exactly this decision.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Caller (page/route/test)
+    participant K as Kairos.execute
+    participant H as Handler
+    participant S as Event Store
+    C->>K: execute(subscribeStudent, input)
+    K->>K: validate input (Zod)
+    K->>H: run handler with ctx
+    H->>S: ctx.read({tags, eventTypes})
+    S-->>H: events + appendCondition
+    H->>H: fold events, check rules
+    H->>S: ctx.append(newEvents, appendCondition)
+    S-->>H: {position}
+    H-->>K: done
+    K-->>C: {position}
+```
 
 ---
 
-## 3. Projections as derived state
+## Idea 3: Dynamic Consistency Boundaries (DCB)
 
-A **projection** is a read model derived from the event log. In Kairos, a projection is a named function that reacts to specific event types and maintains a Drizzle table.
+Now for the central idea.
+
+### The classical headache
+
+Traditional Domain-Driven Design says: group related state into an **aggregate**, make that aggregate the unit of consistency, and enforce that one transaction touches exactly one aggregate. Every invariant has to fit inside one aggregate.
+
+Apply that to our two rules:
+
+- "Course capacity cannot be exceeded" — feels like a rule on `Course`.
+- "A student is in at most five courses" — feels like a rule on `Student`.
+
+But *subscribing a student* needs **both** rules to hold at the same time. Where does the rule live? On `Course`? On `Student`? A `SubscriptionService` that touches both aggregates and fights eventual-consistency ghosts? Every option is awkward. This is the hardest call in classical DDD, and most teams get it wrong at least once.
+
+### What DCB does differently
+
+**Dynamic Consistency Boundaries** ([introduced in Axon Framework 5](https://www.axoniq.io/blog/dcb-in-af-5)) flip the model: instead of defining aggregates up front and forcing rules to fit inside them, each *command* declares its own consistency boundary — as a query over events, decided on the spot.
+
+Look back at `subscribeStudent`. The handler says:
 
 ```ts
-defineProjection({
+await ctx.read({
+  tags: [{ courseId }, { studentId }],
+  eventTypes: ['CourseCreated', 'StudentSubscribed'],
+})
+```
+
+That query is the consistency boundary for *this* command. It says: "to make this decision correctly, I need to read the events tagged with this course OR this student, of these types. And I want to be certain that no new events matching this query appear between now and when I append."
+
+The append:
+
+```ts
+await ctx.append(events, appendCondition)
+```
+
+carries a receipt from the read (`appendCondition = { query, maxReadPosition }`). The store checks, atomically: *has any event matching `query` with `position > maxReadPosition` landed?* If no, it inserts the new events. If yes, it throws `DCBConflictError`.
+
+### DCB in action — the happy path
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Cmd as SubscribeStudent
+    participant S as Event Store
+    Cmd->>S: read(tags:[{courseId:"c1"},{studentId:"s1"}])
+    S-->>Cmd: events (capacity=2, 0 subs), maxReadPosition=1
+    Cmd->>Cmd: decide: OK to subscribe
+    Cmd->>S: append([StudentSubscribed], cond={query, max:1})
+    Note over S: No events >1 match query ✓
+    S-->>Cmd: position=2 ✓
+```
+
+### DCB in action — two commands racing for the last seat
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Request A (student sA)
+    participant B as Request B (student sB)
+    participant S as Event Store
+    A->>S: read(tags:[{courseId:"c1"}])
+    S-->>A: events, maxReadPosition=1
+    B->>S: read(tags:[{courseId:"c1"}])
+    S-->>B: events, maxReadPosition=1
+    Note over A,B: Both see 1 seat left
+    B->>S: append([StudentSubscribed sB], cond={max:1})
+    S-->>B: position=2 ✓
+    A->>S: append([StudentSubscribed sA], cond={max:1})
+    Note over S: Event at pos 2 matches query ✗
+    S-->>A: DCBConflictError
+```
+
+Request A retries from the top, rereads, finds the course full, rejects cleanly. No race, no phantom, no double-booking — and no lock.
+
+### Why this is better
+
+- **Boundaries span what they need to span.** Our "spans student and course" rule is trivial now: tag events with both `courseId` and `studentId`, query on both.
+- **No aggregate refactors.** Change what a command considers consistent by changing its query. No schema change, no moving methods between classes.
+- **Smaller blast radius.** Two commands that query unrelated tag sets don't conflict with each other, even if they write the same event types. Concurrency improves without coordination.
+- **Invariants live where they're enforced.** The rule about "course full" appears literally in the command that enforces it. No hunting.
+
+---
+
+## Idea 4: projections as read models
+
+The event log is authoritative, but you don't want your pages to replay events every time they render. You want *tables*.
+
+A **projection** is a named handler that listens for specific event types and maintains its own Drizzle table. Kairos runs a background loop that feeds events through each projection in order and tracks a cursor so it knows where it left off.
+
+```ts
+import { defineProjection } from 'kairos'
+import { pgTable, text, timestamp } from 'drizzle-orm/pg-core'
+
+export const enrollmentsTable = pgTable('enrollments', {
+  courseId:  text('course_id').notNull(),
+  studentId: text('student_id').notNull(),
+  at:        timestamp('at', { withTimezone: true }).notNull(),
+})
+
+export const enrollments = defineProjection({
   name: 'enrollments',
   on: {
     StudentSubscribed: async (event, tx) => {
       await tx.insert(enrollmentsTable).values({
         courseId:  event.tags.courseId,
         studentId: event.tags.studentId,
+        at:        event.recordedAt,
       })
     },
   },
 })
 ```
 
-Projections run asynchronously in a background loop inside the Next.js server. Each projection tracks its own cursor (the last event position it processed), stored in Postgres alongside the events.
+Your React Server Component queries the `enrollmentsTable` directly as plain Drizzle. Kairos doesn't sit between your pages and your read model.
 
-**Your RSC code queries projection tables directly as Drizzle tables.** The framework does not stand between your pages and your read model. That's deliberate — a custom query layer would be a cost without a benefit.
+```mermaid
+flowchart LR
+    Cmd[Command] -- appends --> Log[(Event log)]
+    Log -- polled by cursor --> Runner[Projection runner]
+    Runner -- dispatch by type --> P1[enrollments projection]
+    Runner -- dispatch by type --> P2[courses projection]
+    P1 -- writes --> T1[(enrollments table)]
+    P2 -- writes --> T2[(courses table)]
+    T1 -.->|read by| RSC[React Server Components]
+    T2 -.->|read by| RSC
+```
 
 ### Read-your-own-writes
 
-Projections are eventually consistent. After `execute(command)` you get back a `position`. If the same request needs to read what it just wrote:
+Projections are **eventually consistent** — they lag the event log by a few milliseconds. If the request that just ran a command needs to read what it wrote, wait for the projection to catch up:
 
 ```ts
 const { position } = await kairos.execute(subscribeStudent, input)
 await kairos.waitForProjection('enrollments', position)
-// projection is now guaranteed caught up past the command's events
+// the projection is now caught up past your command
 ```
 
-Server actions can wait automatically via `toServerAction(command, { waitFor: 'enrollments' })`.
+Server actions do this automatically if you say so:
+
+```ts
+export const subscribe = toServerAction(subscribeStudent, {
+  kairos,
+  waitFor: 'enrollments',
+})
+```
 
 ### Rebuilds
 
-`kairos.rebuild('enrollments')` truncates the projection table, resets its cursor to zero, and re-runs every event through the handler. This is the answer to "I changed my read model" — no migrations, just rebuild.
+Changed your mind about a read model? Run `kairos.rebuild('enrollments')`. The projection table is truncated, the cursor resets to zero, and every event flows through the handler again. No migrations. Read models are disposable by design.
 
 ---
 
-## 4. Dynamic Consistency Boundaries (DCB)
+## Putting it together
 
-This is the part worth understanding deeply because it's what makes Kairos different from most ES frameworks.
+- **Events** are immutable, tagged, past-tense facts.
+- **Commands** are functions that read events, decide, and append more events.
+- **DCB** guarantees that the events you read can't change between your read and your append — per command, scoped exactly to the boundary that command needs.
+- **Projections** are the read side — named, async, rebuildable functions that feed plain Drizzle tables your UI queries directly.
 
-### The classical problem
-
-Classical DDD says: group related state into an *aggregate*, make the aggregate the unit of consistency, and enforce that one transaction touches exactly one aggregate. Every consistency concern must fit inside one aggregate boundary.
-
-This breaks down in reality. Consider:
-
-> A student can subscribe to a course only if (a) the course isn't full and (b) the student isn't already in 5 courses.
-
-Where does that invariant live? On `Course`? On `Student`? Neither owns both facts. You end up with domain services, eventual consistency between aggregates, or aggregates that grow too large. None of it is satisfying.
-
-### What DCB does
-
-**Dynamic Consistency Boundaries** (introduced in [Axon Framework 5](https://www.axoniq.io/blog/dcb-in-af-5)) inverts the model: instead of defining aggregates up front, each command *declares its own consistency boundary* as a query over events.
-
-The query says: *"these are the events whose state I need to read, and these are the events whose presence would invalidate my decision."*
-
-The append says: *"write these new events, but only if no new events matching my query have appeared since I read."*
-
-```ts
-const { events, appendCondition } = await ctx.read({
-  tags: [{ courseId }, { studentId }],
-  eventTypes: ['CourseCreated', 'StudentSubscribed'],
-})
-// ...decide...
-await ctx.append(newEvents, appendCondition)
-//                            ↑ guards against concurrent appends matching the same query
-```
-
-The `appendCondition` is an opaque record of `(query, maxReadPosition)`. Postgres checks atomically: is there any event with `position > maxReadPosition` that matches `query`? If yes, throw `DCBConflictError`. If no, insert.
-
-### Why this is better
-
-- **Boundaries span what they need to span.** The subscribe example above is trivial: tag the events with both `courseId` and `studentId`, query on both. Done.
-- **No aggregate refactors.** Change what a command considers consistent by changing its query. No schema change, no moving methods between classes.
-- **Smaller blast radius.** Two commands operating on unrelated tag sets don't conflict, even if they touch the same event types. Concurrency improves without coordination.
-- **Explicit is better than implicit.** The boundary appears literally in the handler that needs it. No hunting for "which aggregate owns this rule."
-
-### Tags
-
-Tags are flat `Record<string, string>`. They are your domain vocabulary: `{ courseId: 'c1' }`, `{ studentId: 's1' }`, `{ organizationId: 'org42', projectId: 'p7' }`.
-
-A DCB query `{ tags: [{ courseId }, { studentId }] }` matches events that contain *either* `{ courseId: '...' }` *or* `{ studentId: '...' }` in their tags (OR between objects, AND within).
-
-Choose tag keys the way you'd choose foreign keys: they're the join points of your domain.
-
----
-
-## Summary
-
-| Concept     | In one line                                                                                 |
-| ----------- | ------------------------------------------------------------------------------------------- |
-| Event       | A recorded, immutable, tagged fact about something that happened.                           |
-| Command     | A function that reads relevant events, decides, and appends new ones — guarded by DCB.      |
-| Projection  | A named, async, rebuildable read model materialized into a Drizzle table.                   |
-| DCB         | "Append these events iff no events matching my query appeared since I read." Per-command.   |
-
-Read [getting-started.md](getting-started.md) next for a full worked example.
+Next: [the getting-started walkthrough](getting-started.html) builds the course-subscription feature end to end.

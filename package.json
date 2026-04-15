@@ -1,0 +1,66 @@
+{
+  "name": "kairos",
+  "version": "0.0.0",
+  "description": "A DCB-first CQRS/Event Sourcing framework for Next.js",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./drizzle": {
+      "types": "./dist/drizzle/index.d.ts",
+      "import": "./dist/drizzle/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js"
+    },
+    "./next": {
+      "types": "./dist/next/index.d.ts",
+      "import": "./dist/next/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "peerDependencies": {
+    "drizzle-orm": ">=0.30.0",
+    "next": ">=14.0.0",
+    "react": ">=18.0.0",
+    "zod": ">=3.22.0"
+  },
+  "peerDependenciesMeta": {
+    "next": { "optional": true },
+    "react": { "optional": true },
+    "drizzle-orm": { "optional": true }
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "drizzle-orm": "^0.30.0",
+    "next": "^14.2.0",
+    "react": "^18.3.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.5.0",
+    "zod": "^3.23.0"
+  },
+  "keywords": [
+    "cqrs",
+    "event-sourcing",
+    "dcb",
+    "ddd",
+    "nextjs",
+    "drizzle",
+    "typescript"
+  ]
+}

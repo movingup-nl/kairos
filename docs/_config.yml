@@ -1,0 +1,19 @@
+title: Kairos
+description: A DCB-first CQRS/Event Sourcing framework for Next.js
+remote_theme: just-the-docs/just-the-docs
+color_scheme: dark
+search_enabled: true
+
+aux_links:
+  "GitHub":
+    - "https://github.com/movingup-nl/kairos"
+
+heading_anchors: true
+back_to_top: true
+back_to_top_text: "Back to top"
+
+footer_content: >-
+  Copyright &copy; 2026 MovingUp. Distributed under the MIT license.
+
+plugins:
+  - jekyll-remote-theme
